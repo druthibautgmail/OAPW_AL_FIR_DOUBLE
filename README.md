@@ -31,7 +31,7 @@ Ist die Konfiguration für das jeweilige Setup einmal optimiert, können die zug
 * **Raspberry Pi 4:** Alternative Plattform; die erreichbare maximale Abtastrate hängt von Konfiguration und Systemlast ab.
 * **Raspberry Pi Compute Module:** Ebenfalls als Basis für dedizierte Audio-Systeme geeignet.
 
-Der Raspberry Pi 3 wurde mit dieser Programmversion noch nicht abschließend auf seine Leistungsfähigkeit getestet.
+Der Raspberry Pi 3 wurde mit dieser Programmversion noch nicht abschließend auf seine Leistungsfähigkeit getestet, ist aber vermutlich wegen der hohen Rechenlast der 192 kHz / 32 Bit Verarbeitung, die intern mit 64-Bit DOUBLE Variablen, Vektoren und Arrays arbeitet, nicht geeignet.
 
 ### Audio-Hardware
 
@@ -82,11 +82,11 @@ sudo apt-get install build-essential libasound2-dev libfftw3-dev
 
 ### 2.2 Repository herunterladen & Kompilieren
 
-Das Repository (Zweig `alsa-edition`) klonen:
+Das Repository klonen:
 
 ```bash
-git clone -b alsa-edition https://github.com/druthibautgmail/OAPW_AL_FIR_DOUBLE.git OAPW_AL_FIR_DOUBLE
-cd OAPW_AL_FIR_DOUBLE
+git clone https://github.com/druthibautgmail/OAPW_AL_FIR_DOUBLE.git OAPW
+cd OAPW
 
 ```
 
@@ -180,8 +180,6 @@ Der Signalweg verbindet den Audio-Player bitperfekt mit der OAPW-DSP-Engine.
 
 ```
 
-**Pegelstruktur (Gain Staging):** Um digitales Clipping bei der RACE-Matrix-Addition zu vermeiden, sollte der Audio-Player den Puffer nicht mit maximalem 0 dBFS Pegel beschreiben, oder es muss in der Web-GUI ein negativer *Makeup Gain* gesetzt werden.
-
 ---
 
 ## 4. Web-GUI und Steuerung
@@ -218,14 +216,14 @@ Füge folgenden Block ein (Pfade und User anpassen!):
 
 ```ini
 [Unit]
-Description=OAPW HiFi ALSA Loopback Player with Fast Fourier Transform / Finite Response Filter Design and double precision math
+Description=OAPW HiFi ALSA Loopback Player with Fast Fourier Transform / Feed Forward Finite Response Filter Design and DOUBLE Precision Math
 After=network.target sound.target
 
 [Service]
 Type=simple
 User=<Dein Username>
-WorkingDirectory=/home/<Dein Username>/OAPW_AL_FIR_DOUBLE
-ExecStart=/home/<Dein Username>/OAPW_AL_FIR_DOUBLE/OAPW_Player
+WorkingDirectory=/home/<Dein Username>/OAPW
+ExecStart=/home/<Dein Username>/OAPW/OAPW_Player
 StandardOutput=journal
 StandardError=journal
 Restart=always
@@ -268,7 +266,7 @@ Die C++ Engine ist für kompromisslose Audioqualität bei 192 kHz ausgelegt. Wic
 
 ## 7. Danksagung
 
-Mein ganz besonderer Dank gilt **Prof. Dr. Dieter Steinhilber**, dessen wertvolle Hinweise, technische Anregungen und tiefgreifendes Verständnis für High-End Audiophilie maßgeblich zur Weiterentwicklung und Reifung dieses Programms beigetragen haben. Konstruktive Kritik dient der stetigen Verbesserung, dem Kritiker gebührt die Co-Autorenschaft!
+Mein ganz besonderer Dank gilt **Prof. Dr. Dieter Steinhilber**, dessen Geduld bei der Hör-Testung immer neuer Releases dieser Software außerordentlich groß war, dessen wertvolle Hinweise, technische Anregungen und tiefgreifendes Verständnis für High-End Audiophilie maßgeblich zur Weiterentwicklung und Reifung dieses Programms beigetragen haben. Konstruktive Kritik dient der stetigen Verbesserung, dem Kritiker gebührt die Co-Autorenschaft!
 
 Ein weiterer Dank gilt **Dr. Michael Graw**, meinem ehemaligen Ambiophonie-Mentor, der mir in meiner aktiven Zeit als CTO der Drägerwerk AG in Lübeck die Augen und vor allem die Ohren für die Ambiophonie geöffnet hat.
 
