@@ -3,3 +3,4 @@ OAPW_Player
 *.wav
 pink_noise.wav
 .DS_Store
+*.csv
