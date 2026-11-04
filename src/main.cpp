@@ -158,8 +158,9 @@ const char* HTML_CONTENT = R"HTML(
     </style>
 </head>
 <body>
-    <h1>OAPW Control - HiFi/ALSA/FFT/FIR/double precision, created by U. Thibaut & D. Steinhilber</h1>
-    
+    <h1>OAPW-Player Control</h1>
+    <h3 style="font-weight: normal; margin-top: -10px;">HiFi/ALSA/FFT/FIR/DOUBLE-PRECISION, V19.0</h3>
+    <h3 style="font-weight: normal; margin-top: -10px;">Created by U. Thibaut & D. Steinhilber</h3>
     <div class="action-row">
         <button class="btn-save" onclick="saveConfig()">💾 Config Speichern</button>
         <button class="btn-reset" onclick="resetDefaults()">↺ Reset Defaults</button>
@@ -206,10 +207,10 @@ const char* HTML_CONTENT = R"HTML(
 
         <label>Interaural Delay <span id="valDelay" class="value-display">68 &micro;s</span></label>
         <div class="control-row">
-            <input type="range" id="delay" min="0" max="200" step="1" value="68" oninput="updateParam('delay', this.value)">
+            <input type="range" id="delay" min="0" max="340" step="2" value="68" oninput="updateParam('delay', this.value)">
             <div class="stepper-buttons">
-                <button onclick="stepValue('delay', 1)">▲</button>
-                <button onclick="stepValue('delay', -1)">▼</button>
+                <button onclick="stepValue('delay', 2)">▲</button>
+                <button onclick="stepValue('delay', -2)">▼</button>
             </div>
         </div>
 
