@@ -8,8 +8,12 @@
 #include <fstream>
 #include <sstream>
 #include <clocale>
+#include <cstdlib>
+#include <optional>
 
 #include "httplib.h"
+#include "InputValidation.h"
+#include "DeviceConfig.h"
 #include "LockFreeRingBuffer.h"
 #include "AlsaCapture.h"
 #include "AlsaPlayback.h"
@@ -24,6 +28,17 @@ const std::string CONFIG_FILE = "oapw_config.txt";
 void signal_handler(int signum) {
     std::cout << "\nSignal " << signum << " empfangen. Beende OAPW_Player_HiFi..." << std::endl;
     g_running.store(false, std::memory_order_release);
+}
+
+// --- Globale Hilfsfunktion zur Pfad-Auflösung (Tilde) ---
+std::string expandTilde(std::string path) {
+    if (!path.empty() && path[0] == '~') {
+        const char* home = std::getenv("HOME");
+        if (home) {
+            path.replace(0, 1, home); // Ersetzt die Tilde durch den Home-Pfad
+        }
+    }
+    return path;
 }
 
 // --- Konfiguration Speichern & Laden ---
@@ -57,6 +72,7 @@ void loadConfig(RACEDspEngine* engine) {
         std::cout << "[Config] Keine bestehende Config gefunden. Nutze Defaults." << std::endl;
         return;
     }
+
     std::string line;
     double delay = 68.0, att = -2.3, center = 0.1; 
     
@@ -65,9 +81,20 @@ void loadConfig(RACEDspEngine* engine) {
         if (pos == std::string::npos) continue;
         std::string key = line.substr(0, pos);
         double val = 0.0;
-        try { val = std::stod(line.substr(pos + 1)); } catch(...) { continue; }
+        if (!InputValidation::parseDouble(line.substr(pos + 1), val)) {
+            std::cerr << "[Config] Ungueltiger Wert ignoriert: " << line << std::endl;
+            continue;
+        }
         
-        if (key == "vol") engine->setVolume(val);
+        if (key == "vol") {
+            // Sicherheit: Nie mit der gespeicherten Lautstaerke "heiss" starten
+            if (val > RACEDspEngine::kMaxStartVolume) {
+                std::cout << "[Config] Startlautstaerke " << val << " auf "
+                          << RACEDspEngine::kMaxStartVolume << " begrenzt." << std::endl;
+                val = RACEDspEngine::kMaxStartVolume;
+            }
+            engine->setVolume(val);
+        }
         else if (key == "makeupGain") engine->setMakeupGain(val);
         else if (key == "race") engine->setRaceEnabled(val != 0);
         else if (key == "filters") engine->setFiltersEnabled(val != 0);
@@ -98,7 +125,7 @@ void loadConfig(RACEDspEngine* engine) {
 }
 
 void resetToDefaults(RACEDspEngine* engine) {
-    engine->setVolume(0.5);
+    engine->setVolume(RACEDspEngine::kDefaultVolume);
     engine->setMakeupGain(0.0);
     engine->setRaceEnabled(true);
     engine->setFiltersEnabled(true);
@@ -143,9 +170,11 @@ const char* HTML_CONTENT = R"HTML(
 
         input[type="range"] { width: 100%; cursor: pointer; margin-bottom: 1rem; }
         input[type="number"] { width: 100%; padding: 10px; margin-bottom: 15px; background: #333; color: white; border: none; border-radius: 4px; box-sizing: border-box; font-size: 1rem; }
+        input[type="text"] { background: #555; color: white; border: 1px solid #777; border-radius: 4px; padding: 5px; }
         .value-display { font-weight: normal; color: #aaa; }
         button { width: 100%; padding: 15px; font-size: 1.2rem; font-weight: bold; border: none; border-radius: 8px; cursor: pointer; background: #007aff; color: white; margin-bottom: 1.0rem; transition: background 0.3s;}
         button.off { background: #333; color: #888; }
+        button:disabled { background: #444; color: #777; cursor: not-allowed; }
 
         button.btn-save { background: #007aff; }
         button.btn-save:hover { background: #0a84ff; }
@@ -155,16 +184,41 @@ const char* HTML_CONTENT = R"HTML(
         h3 { margin-top: 0; margin-bottom: 1rem; font-weight: 500; color: #007aff; }
         h4 { margin-top: 0; margin-bottom: 1rem; color: #fff; font-size: 1rem; }
         canvas { width: 100%; height: 180px; background: #000; border-radius: 8px; margin-bottom: 1rem; display: block; border: 1px solid #333; }
+        
+        .control-block { margin-bottom: 1.5rem; background: #1e1e1e; padding: 1.5rem; border-radius: 8px; }
     </style>
 </head>
 <body>
     <h1>OAPW-Player Control</h1>
-    <h3 style="font-weight: normal; margin-top: -10px;">HiFi/ALSA/FFT/FIR/DOUBLE-PRECISION, V19.0</h3>
+    <h3 style="font-weight: normal; margin-top: -10px;">HiFi/ALSA/FFT/FIR/DOUBLE-PRECISION, V21.0</h3>
     <h3 style="font-weight: normal; margin-top: -10px;">Created by U. Thibaut & D. Steinhilber</h3>
     <div class="action-row">
         <button class="btn-save" onclick="saveConfig()">💾 Config Speichern</button>
         <button class="btn-reset" onclick="resetDefaults()">↺ Reset Defaults</button>
     </div>
+
+    <!-- Neu in Version 20.0, Control Group für die Speicherung von .wav und .flac Dateinen nach Prozessierung durch RACE Algorithmus U. Thibaut, 06.11.26 -->
+
+    <div id="recording-controls" class="control-block">
+        <button onclick="openRecordModal('wav')" id="btn-record-wav">⏺ .wav Aufnahme</button>
+        <button onclick="openRecordModal('flac')" id="btn-record-flac">⏺ .flac Aufnahme</button>
+        <button onclick="stopRecording()" id="btn-record-stop" disabled>⏹ Aufnahme stoppen</button>
+        <span id="recording-status" style="color: red; display: none;">Aufnahme läuft...</span>
+    </div>
+
+    <!-- Modal für die Pfadeingabe -->
+    <div id="recordModal" style="display:none; position:fixed; top:20%; left:50%; transform:translate(-50%, 0); background:#333; padding:20px; border:1px solid #555; z-index:1000; box-shadow: 0 4px 8px rgba(0,0,0,0.5);">
+        <h3>Speicherort für Audiodatei</h3>
+        <p>Bitte den Zielpfad auf dem Hostsystem angeben:</p>
+        <input type="text" id="savePath" value="~/Music/" style="width: 300px; padding: 10px; margin-bottom: 10px;" />
+        <input type="hidden" id="saveFormat" />
+        <div style="margin-top: 15px; display: flex; gap: 10px;">
+            <button onclick="startRecording()" style="margin-bottom: 0;">Speichern starten</button>
+            <button onclick="closeRecordModal()" style="margin-bottom: 0; background: #555;">Abbrechen</button>
+        </div>
+    </div>
+
+    <!-- Einfügung Ende 06.11.26 -->
 
     <button id="btnRace" onclick="toggleRace()">RACE: AN</button>
     <button id="btnFilters" onclick="toggleFilters()">Filter: AN</button>
@@ -198,7 +252,7 @@ const char* HTML_CONTENT = R"HTML(
 
         <label>Makeup Gain <span id="valMakeupGain" class="value-display">0.0 dB</span></label>
         <div class="control-row">
-            <input type="range" id="makeupGain" min="0" max="12" step="0.5" value="0" oninput="updateParam('makeupGain', this.value)">
+            <input type="range" id="makeupGain" min="0" max="6" step="0.5" value="0" oninput="updateParam('makeupGain', this.value)">
             <div class="stepper-buttons">
                 <button onclick="stepValue('makeupGain', 0.5)">▲</button>
                 <button onclick="stepValue('makeupGain', -0.5)">▼</button>
@@ -367,6 +421,53 @@ const char* HTML_CONTENT = R"HTML(
             if(param === 'freqHigh') document.getElementById('valFreqHigh').innerHTML = value + ' Hz';
             fetch(`/api/update?${param}=${value}`);
         }
+
+        // JS Logik für das Herausschreiben von .wav und .flac Dateien, U. Thibaut, 06.11.26
+        function openRecordModal(format) {
+            document.getElementById('saveFormat').value = format;
+            document.getElementById('recordModal').style.display = 'block';
+        }
+
+        function closeRecordModal() {
+            document.getElementById('recordModal').style.display = 'none';
+        }
+
+        async function startRecording() {
+            const path = document.getElementById('savePath').value;
+            const format = document.getElementById('saveFormat').value;
+            
+            // Pfad bereinigen und Dateinamen anhängen
+            const fullPath = path.endsWith('/') ? 
+                `${path}oapw_processed.${format}` : 
+                `${path}/oapw_processed.${format}`;
+
+            const response = await fetch('/api/record/start', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ path: fullPath, format: format })
+            });
+
+            if (response.ok) {
+                closeRecordModal();
+                document.getElementById('btn-record-wav').disabled = true;
+                document.getElementById('btn-record-flac').disabled = true;
+                document.getElementById('btn-record-stop').disabled = false;
+                document.getElementById('recording-status').style.display = 'inline';
+            } else {
+                alert("Fehler beim Starten der Aufnahme. Pfadrechte prüfen.");
+            }
+        }
+
+        async function stopRecording() {
+            const response = await fetch('/api/record/stop', { method: 'POST' });
+            if (response.ok) {
+                document.getElementById('btn-record-wav').disabled = false;
+                document.getElementById('btn-record-flac').disabled = false;
+                document.getElementById('btn-record-stop').disabled = true;
+                document.getElementById('recording-status').style.display = 'none';
+            }
+        }
+        // Ende der neuen Funktionen für Speicherung von .wav und .flac Dateien, U. Thibaut, 06.11.26
 
         function stepValue(sliderId, step) {
             const slider = document.getElementById(sliderId);
@@ -591,6 +692,58 @@ void webServerLoop(RACEDspEngine* dspEngine) {
         res.set_content(HTML_CONTENT, "text/html");
     });
 
+    // --- Aufnahme POST-Endpunkte (Natives JSON-Parsing) ---
+    svr.Post("/api/record/start", [dspEngine](const httplib::Request& req, httplib::Response& res) {
+        std::string body = req.body;
+        std::string path_key = "\"path\":\"";
+        std::string format_key = "\"format\":\"";
+        
+        size_t path_pos = body.find(path_key);
+        size_t format_pos = body.find(format_key);
+        
+        if (path_pos == std::string::npos || format_pos == std::string::npos) {
+            res.status = 400;
+            res.set_content("Fehler: Ungueltiges JSON", "text/plain");
+            return;
+        }
+        
+        size_t path_start = path_pos + path_key.length();
+        size_t path_end = body.find("\"", path_start);
+        if (path_end == std::string::npos || path_end == path_start) {
+            res.status = 400;
+            res.set_content("Fehler: Dateipfad fehlt oder JSON unvollstaendig", "text/plain");
+            return;
+        }
+        std::string filepath = body.substr(path_start, path_end - path_start);
+
+        // NEU: Tilde auflösen, damit ~/Music direkt ins Home-Verzeichnis des Users unter /Music/oapw_processed.wav oder .flac speichert
+        filepath = expandTilde(filepath);
+
+        size_t format_start = format_pos + format_key.length();
+        size_t format_end = body.find("\"", format_start);
+        if (format_end == std::string::npos) {
+            res.status = 400;
+            res.set_content("Fehler: JSON unvollstaendig", "text/plain");
+            return;
+        }
+        std::string format = body.substr(format_start, format_end - format_start);
+
+        // Kapselung in der RACEDspEngine aufrufen
+        if (dspEngine->startRecording(filepath, format)) {
+            res.status = 200;
+            res.set_content("Aufnahme gestartet", "text/plain");
+        } else {
+            res.status = 500;
+            res.set_content("Fehler beim Erstellen der Datei auf dem Laufwerk", "text/plain");
+        }
+    });
+
+    svr.Post("/api/record/stop", [dspEngine](const httplib::Request& req, httplib::Response& res) {
+        dspEngine->stopRecording();
+        res.status = 200;
+        res.set_content("Aufnahme beendet", "text/plain");
+    });
+
     svr.Get("/api/save", [dspEngine](const httplib::Request&, httplib::Response& res) {
         saveConfig(dspEngine);
         res.set_content("Saved", "text/plain");
@@ -637,40 +790,70 @@ void webServerLoop(RACEDspEngine* dspEngine) {
     });
 
     svr.Get("/api/update", [dspEngine](const httplib::Request& req, httplib::Response& res) {
-        if (req.has_param("vol")) dspEngine->setVolume(std::stod(req.get_param_value("vol")) / 100.0);
-        if (req.has_param("makeupGain")) dspEngine->setMakeupGain(std::stod(req.get_param_value("makeupGain")));
-        if (req.has_param("race")) dspEngine->setRaceEnabled(std::stoi(req.get_param_value("race")) != 0);
-        if (req.has_param("filters")) dspEngine->setFiltersEnabled(std::stoi(req.get_param_value("filters")) != 0);
-        if (req.has_param("lowBypass")) dspEngine->setLowBypassEnabled(std::stoi(req.get_param_value("lowBypass")) != 0);
-        if (req.has_param("eq")) dspEngine->setEqEnabled(std::stoi(req.get_param_value("eq")) != 0);
+        using InputValidation::parseDouble;
 
-        if (req.has_param("delay") || req.has_param("att") || req.has_param("center")) {
-            double delayUs = dspEngine->getDelayUs();
-            double attDb = dspEngine->getAttenuationDb();
-            double center = dspEngine->getCenterP();
-            
-            if (req.has_param("delay")) delayUs = std::stod(req.get_param_value("delay"));
-            if (req.has_param("att")) attDb = std::stod(req.get_param_value("att"));
-            if (req.has_param("center")) center = std::stod(req.get_param_value("center")) / 100.0;
-            
-            dspEngine->setParameters(delayUs, attDb, center, dspEngine->getFreqLimit());
+        // Phase 1: Alle uebergebenen Parameter einlesen und pruefen. Ist irgendein Wert
+        // ungueltig (keine Zahl, NaN, Inf, Textmuell), wird NICHTS angewendet und mit 400
+        // geantwortet. Bisher fuehrte std::stod/stoi hier zu Exceptions bzw. liess "nan" durch.
+        std::string badParam;
+        auto readNumber = [&](const std::string& name, std::optional<double>& out) {
+            if (!req.has_param(name)) return;
+            double v = 0.0;
+            if (parseDouble(req.get_param_value(name), v)) out = v;
+            else if (badParam.empty()) badParam = name;
+        };
+
+        std::optional<double> vol, makeupGain, race, filters, lowBypass, eq;
+        std::optional<double> delay, att, center, freqLow, freqHigh;
+        std::optional<double> eqF[3], eqQ[3], eqG[3];
+
+        readNumber("vol", vol);
+        readNumber("makeupGain", makeupGain);
+        readNumber("race", race);
+        readNumber("filters", filters);
+        readNumber("lowBypass", lowBypass);
+        readNumber("eq", eq);
+        readNumber("delay", delay);
+        readNumber("att", att);
+        readNumber("center", center);
+        readNumber("freqLow", freqLow);
+        readNumber("freqHigh", freqHigh);
+        for (int b = 0; b < 3; b++) {
+            const std::string prefix = "eq" + std::to_string(b);
+            readNumber(prefix + "f", eqF[b]);
+            readNumber(prefix + "q", eqQ[b]);
+            readNumber(prefix + "g", eqG[b]);
         }
 
-        if (req.has_param("freqLow")) {
-            dspEngine->setCrossoverFreqLow(std::stod(req.get_param_value("freqLow")));
-        }
-        if (req.has_param("freqHigh")) {
-            dspEngine->setCrossoverFreqHigh(std::stod(req.get_param_value("freqHigh")));
+        if (!badParam.empty()) {
+            res.status = 400;
+            res.set_content("Ungueltiger Wert fuer Parameter: " + badParam, "text/plain");
+            return;
         }
 
-        for(int b=0; b<3; b++) {
-            std::string pf = "eq" + std::to_string(b) + "f";
-            std::string pq = "eq" + std::to_string(b) + "q";
-            std::string pg = "eq" + std::to_string(b) + "g";
-            if (req.has_param(pf) || req.has_param(pq) || req.has_param(pg)) {
-                double f = req.has_param(pf) ? std::stod(req.get_param_value(pf)) : dspEngine->getEqFreq(b);
-                double q = req.has_param(pq) ? std::stod(req.get_param_value(pq)) : dspEngine->getEqQ(b);
-                double g = req.has_param(pg) ? std::stod(req.get_param_value(pg)) : dspEngine->getEqGain(b);
+        // Phase 2: Anwenden. Die Engine begrenzt die Wertebereiche zusaetzlich selbst.
+        if (vol) dspEngine->setVolume(*vol / 100.0);
+        if (makeupGain) dspEngine->setMakeupGain(*makeupGain);
+        if (race) dspEngine->setRaceEnabled(*race != 0.0);
+        if (filters) dspEngine->setFiltersEnabled(*filters != 0.0);
+        if (lowBypass) dspEngine->setLowBypassEnabled(*lowBypass != 0.0);
+        if (eq) dspEngine->setEqEnabled(*eq != 0.0);
+
+        if (delay || att || center) {
+            const double delayUs = delay ? *delay : dspEngine->getDelayUs();
+            const double attDb = att ? *att : dspEngine->getAttenuationDb();
+            const double centerP = center ? (*center / 100.0) : dspEngine->getCenterP();
+            dspEngine->setParameters(delayUs, attDb, centerP, dspEngine->getFreqLimit());
+        }
+
+        if (freqLow) dspEngine->setCrossoverFreqLow(*freqLow);
+        if (freqHigh) dspEngine->setCrossoverFreqHigh(*freqHigh);
+
+        for (int b = 0; b < 3; b++) {
+            if (eqF[b] || eqQ[b] || eqG[b]) {
+                const double f = eqF[b] ? *eqF[b] : dspEngine->getEqFreq(b);
+                const double q = eqQ[b] ? *eqQ[b] : dspEngine->getEqQ(b);
+                const double g = eqG[b] ? *eqG[b] : dspEngine->getEqGain(b);
                 dspEngine->setEqBand(b, f, q, g);
             }
         }
@@ -681,21 +864,47 @@ void webServerLoop(RACEDspEngine* dspEngine) {
     svr.listen("0.0.0.0", 8080); 
 }
 
-int main() {
+int main(int argc, char** argv) {
     std::setlocale(LC_ALL, "C"); 
     
+    // Geraete: Defaults < oapw_device.txt < Kommandozeile (siehe DeviceConfig.h, --help)
+    DeviceConfigNS::DeviceConfig devCfg;
+    switch (DeviceConfigNS::parseArgs(argc, argv, devCfg)) {
+        case DeviceConfigNS::ParseResult::ExitOk:    return 0;
+        case DeviceConfigNS::ParseResult::ExitError: return 2;
+        case DeviceConfigNS::ParseResult::Run:       break;
+    }
+
     std::signal(SIGINT, signal_handler);
     std::signal(SIGTERM, signal_handler);
 
     std::cout << "=== OAPW_Player_HiFi Engine (ALSA Loopback) ===" << std::endl;
 
-    const std::string capture_device = "hw:Loopback,1,0";
-    const std::string playback_device = "hw:Katana,0"; 
+    const std::string capture_device = devCfg.capture;
+    const std::string playback_device = devCfg.playback;
 
-    const unsigned int sample_rate = 192000;
+    const unsigned int sample_rate = devCfg.rate;
     const unsigned int channels = 2;
-    const snd_pcm_format_t capture_format = SND_PCM_FORMAT_S32_LE;
-    const snd_pcm_format_t playback_format = SND_PCM_FORMAT_S32_LE;
+    snd_pcm_format_t capture_format = SND_PCM_FORMAT_S32_LE;
+    snd_pcm_format_t playback_format = SND_PCM_FORMAT_S32_LE;
+    DeviceConfigNS::parseFormat(devCfg.captureFormat, capture_format);
+    DeviceConfigNS::parseFormat(devCfg.playbackFormat, playback_format);
+
+    if (sample_rate != 192000) {
+        std::cout << "[Geraet] Hinweis: Getestet ist bisher nur 192000 Hz (Filterlaengen und "
+                     "Latenz sind darauf ausgelegt)." << std::endl;
+    }
+
+    // Vorabpruefung: lieber hier mit klarer Meldung abbrechen als mit halb passenden Parametern
+    // zu spielen (ALSA wuerde Rate/Format sonst still umbiegen).
+    const bool captureOk  = DeviceConfigNS::probeDevice(capture_device, SND_PCM_STREAM_CAPTURE,
+                                capture_format, sample_rate, channels, "Eingang");
+    const bool playbackOk = DeviceConfigNS::probeDevice(playback_device, SND_PCM_STREAM_PLAYBACK,
+                                playback_format, sample_rate, channels, "DAC");
+    if (!captureOk || !playbackOk) {
+        std::cerr << "Abbruch: Geraeteeinstellungen passen nicht (siehe oben)." << std::endl;
+        return 2;
+    }
 
     const size_t ring_buffer_size = 131072;
     LockFreeRingBuffer<float> ring_buffer(ring_buffer_size);
@@ -713,6 +922,7 @@ int main() {
     std::vector<double> dsp_work_buffer;
 
     playback.set_dsp_callback([&race_engine](float* buffer, size_t frames) {
+        // Der Aufruf bleibt unverändert, da die RACEDspEngine nun selbstständig auf die Festplatte schreibt
         race_engine.processSamples(buffer, frames);
     });
 
@@ -747,3 +957,4 @@ int main() {
     std::cout << "OAPW_Player_HiFi erfolgreich beendet." << std::endl;
     return 0;
 }
+

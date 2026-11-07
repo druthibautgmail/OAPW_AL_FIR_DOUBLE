@@ -9,6 +9,33 @@
 #endif
 
 // ---------------------------------------------------------
+// RACE (Recursive Ambiophonic Crosstalk Elimination)
+//
+// Die Gegenkopplung wird vom AUSGANG des RACE-Pfads abgegriffen:
+//
+//   oL[n] = iL[n] - a/(1+p) * ( oR[n-d] - p * oL[n-d] )
+//   oR[n] = iR[n] - a/(1+p) * ( oL[n-d] - p * oR[n-d] )
+//
+//   a = attenuationLinear, p = centerP, d = dn (Samples)
+//
+// Zerlegt man in Summe (L=R) und Differenz (L=-R), ergeben sich die Pole
+//   Summe:     z^-d * a*(1-p)/(1+p)   -> H = 1 / (1 + a*(1-p)/(1+p) * z^-d)
+//   Differenz: z^-d * a               -> H = 1 / (1 - a * z^-d)
+// Stabil ist die Schleife nur fuer a < 1 und p >= 0 (Begruendung siehe
+// setParameters). Da die Struktur jetzt ein IIR-Filter ist, bleiben NaN/Inf
+// und Denormals im Rueckkopplungspfad sonst dauerhaft erhalten; beides wird
+// in processSamples abgefangen.
+// ---------------------------------------------------------
+static constexpr double kMaxRaceFeedback = 0.95;   // Obergrenze fuer a (muss < 1 sein)
+static constexpr double kDenormalGuard   = 1e-25;  // Rueckkopplungswerte darunter -> 0
+
+// Grenzen fuer Eingaben (zusaetzlich zur Pruefung in der Web-Schicht). NaN/Inf und
+// unsinnige Frequenzen wuerden sonst in den Filterentwurf laufen (Division durch 0, NaN).
+static constexpr double kMinFilterFreqHz   = 20.0;   // untere Grenze fuer Crossover und EQ
+static constexpr double kMaxFreqFraction   = 0.45;   // obere Grenze = 0.45 * Abtastrate
+static constexpr double kMinCrossoverGapHz = 100.0;  // Mindestabstand freqLow <-> freqHigh
+
+// ---------------------------------------------------------
 // FFT Helper für den Web-Analyzer (UI bleibt 32-Bit Float)
 // ---------------------------------------------------------
 void computeFFT(std::vector<std::complex<float>>& data) {
@@ -207,7 +234,12 @@ RACEDspEngine::RACEDspEngine(double initialDelayUs, double initialAttenuationDb,
     lowR.resize(32768, 0.0); midR.resize(32768, 0.0); highR.resize(32768, 0.0);
 
     writeIndex = 0;
-    volume = 1.0;
+    volume = kDefaultVolume;
+    // Anstiegsbegrenzung: Start immer bei Stille, hoch max. 0,5 pro Sekunde (Vollaussteuerung
+    // in 2 s), runter schnell (50 ms). Gilt auch fuer den Web-Regler.
+    volumeRamp = 0.0;
+    volumeStepUp   = 0.5 / static_cast<double>(sr);
+    volumeStepDown = 20.0 / static_cast<double>(sr);
     makeupGainDb = 0.0;
     makeupGainLinear = 1.0;
     raceEnabled = true;
@@ -230,29 +262,58 @@ RACEDspEngine::RACEDspEngine(double initialDelayUs, double initialAttenuationDb,
     setParameters(initialDelayUs, initialAttenuationDb, initialCenterP, initialFreqLimit);
 }
 
-RACEDspEngine::~RACEDspEngine() {}
+//RACEDspEngine::~RACEDspEngine() {}
+RACEDspEngine::~RACEDspEngine() {
+    stopRecording();
+}
 
 void RACEDspEngine::setParameters(double newDelayUs, double newAttenuationDb, double newCenterP, bool newFreqLimit) {
     std::lock_guard<std::mutex> lock(dspMutex);
+    // NaN/Inf wuerden Delay-Berechnung und Rueckkopplung vergiften -> auf Standardwerte
+    if (!std::isfinite(newDelayUs)) newDelayUs = 68.0;
+    if (!std::isfinite(newAttenuationDb)) newAttenuationDb = -2.3;
+    if (!std::isfinite(newCenterP)) newCenterP = 0.1;
     delayUs = newDelayUs;
     attenuationDb = newAttenuationDb;
     
     double safeAtten = std::abs(attenuationDb);
     attenuationLinear = std::pow(10.0, -safeAtten / 20.0);
-    
+
+    // Stabilitaet der Rekursion: Der Differenz-Pol liegt bei a, es muss also a < 1 gelten.
+    // (Bei a = 1, also 0 dB, waere die Schleife grenzstabil; das Differenzsignal haette
+    // bei tiefen Frequenzen unendliche Verstaerkung.) "!(x < max)" faengt auch NaN ab.
+    if (!(attenuationLinear < kMaxRaceFeedback)) attenuationLinear = kMaxRaceFeedback;
+
+    // centerP in [0, 1]: Der Summen-Pol liegt bei a*(1-p)/(1+p). Fuer p < 0 kann dessen
+    // Betrag 1 ueberschreiten (Instabilitaet), fuer p = -1 wuerde durch 0 geteilt.
+    if (!(newCenterP >= 0.0)) newCenterP = 0.0;
+    if (newCenterP > 1.0) newCenterP = 1.0;
     centerP = newCenterP;
     freqLimitRACE = newFreqLimit;
-    
-    dn = static_cast<int>(delayUs * static_cast<double>(sampleRate) / 1000000.0);
-    if (dn < 5) dn = 10; 
+
+    // Delay in Samples. Mindestens 1 Sample, weil die Rekursion sonst eine algebraische
+    // Schleife waere; hoechstens bufferSize-1, damit der Lesezugriff im Ringpuffer
+    // gueltig bleibt. Der bisherige Sonderfall "< 5 Samples -> 10 Samples" bleibt
+    // bestehen. NaN landet ebenfalls im ersten Zweig.
+    const double delaySamples = delayUs * static_cast<double>(sampleRate) / 1000000.0;
+    const int maxDn = static_cast<int>(delayBufferL.size()) - 1;
+    if (!(delaySamples >= 5.0)) dn = 10;
+    else if (delaySamples > static_cast<double>(maxDn)) dn = maxDn;
+    else dn = static_cast<int>(delaySamples);
 }
 
-void RACEDspEngine::setVolume(double newVolume) { std::lock_guard<std::mutex> lock(dspMutex); volume = newVolume; }
+void RACEDspEngine::setVolume(double newVolume) {
+    if (!std::isfinite(newVolume)) return;
+    std::lock_guard<std::mutex> lock(dspMutex);
+    volume = std::clamp(newVolume, 0.0, 1.0);
+}
 
-void RACEDspEngine::setMakeupGain(double gainDb) { 
-    std::lock_guard<std::mutex> lock(dspMutex); 
-    makeupGainDb = gainDb; 
-    makeupGainLinear = std::pow(10.0, makeupGainDb / 20.0); 
+void RACEDspEngine::setMakeupGain(double gainDb) {
+    if (!std::isfinite(gainDb)) return;
+    gainDb = std::clamp(gainDb, -24.0, kMaxMakeupGainDb);
+    std::lock_guard<std::mutex> lock(dspMutex);
+    makeupGainDb = gainDb;
+    makeupGainLinear = std::pow(10.0, makeupGainDb / 20.0);
 }
 double RACEDspEngine::getMakeupGain() { return makeupGainDb; }
 
@@ -261,6 +322,11 @@ void RACEDspEngine::setFiltersEnabled(bool enabled) { std::lock_guard<std::mutex
 void RACEDspEngine::setEqEnabled(bool enabled) { std::lock_guard<std::mutex> lock(dspMutex); eqEnabled = enabled; }
 
 void RACEDspEngine::setEqBand(int bandIndex, double freq, double q, double gainDb) {
+    // q <= 0 oder NaN wuerde im Biquad-Entwurf zu NaN im gesamten EQ-Spektrum fuehren
+    if (!std::isfinite(freq) || !std::isfinite(q) || !std::isfinite(gainDb)) return;
+    freq = std::clamp(freq, kMinFilterFreqHz, kMaxFreqFraction * static_cast<double>(sampleRate));
+    q = std::clamp(q, 0.1, 20.0);
+    gainDb = std::clamp(gainDb, -24.0, 24.0);
     std::lock_guard<std::mutex> lock(dspMutex);
     if(bandIndex >= 0 && bandIndex < 3) { 
         eqBands[bandIndex] = {freq, q, gainDb};
@@ -277,11 +343,33 @@ void RACEDspEngine::setEqBand(int bandIndex, double freq, double q, double gainD
 void RACEDspEngine::processSamples(float* interleavedSamples, size_t frames) {
     std::lock_guard<std::mutex> lock(dspMutex);
 
+    // Aufnahme: wird am Ende JEDES Pfades (Bypass und DSP) ausgefuehrt. Bisher uebersprang
+    // der fruehe return im Bypass-Zweig die Aufnahme, die Datei blieb dann leer bzw. luecken-
+    // haft. Hinweis: try_lock schuetzt nur vor Konkurrenz mit start/stopRecording, nicht
+    // vor einem blockierenden sf_writef_float (siehe Writer-Thread, Paket B).
+    auto writeRecording = [this, interleavedSamples, frames]() {
+        if (!is_recording.load()) return;
+        if (record_mutex.try_lock()) {
+            if (outfile != nullptr) {
+                sf_writef_float(outfile, interleavedSamples, static_cast<sf_count_t>(frames));
+            }
+            record_mutex.unlock();
+        }
+    };
+
+    // Lautstaerke pro Sample zum Ziel nachfuehren (schnell runter, langsam hoch)
+    auto nextVolume = [this]() -> double {
+        if (volumeRamp < volume)      volumeRamp = std::min(volume, volumeRamp + volumeStepUp);
+        else if (volumeRamp > volume) volumeRamp = std::max(volume, volumeRamp - volumeStepDown);
+        return volumeRamp;
+    };
+
     // KORRIGIERTER Bypass-Block
     if (!filtersEnabled) {
         for (size_t i = 0; i < frames; i++) {
-            double outL = static_cast<double>(interleavedSamples[i * 2]) * volume;
-            double outR = static_cast<double>(interleavedSamples[i * 2 + 1]) * volume;
+            const double vol = nextVolume();
+            double outL = static_cast<double>(interleavedSamples[i * 2]) * vol;
+            double outR = static_cast<double>(interleavedSamples[i * 2 + 1]) * vol;
             
             outL = std::clamp(outL, -1.0, 1.0);
             outR = std::clamp(outR, -1.0, 1.0);
@@ -292,9 +380,10 @@ void RACEDspEngine::processSamples(float* interleavedSamples, size_t frames) {
             spectrumBuffer[spectrumIndex] = static_cast<float>((outL + outR) * 0.5);
             spectrumIndex = (spectrumIndex + 1) % 32768;
         }
+        writeRecording();
         return;
     }
-    
+
     int L = 32768;
     int bufferSize = delayBufferL.size();
 
@@ -338,24 +427,39 @@ void RACEDspEngine::processSamples(float* interleavedSamples, size_t frames) {
                 midInR  = lowR[k] + midR[k] + highR[k];
             }
 
+            // --- RACE mit echter Rekursion ---
+            // Gelesen wird der um dn Samples verzoegerte RACE-AUSGANG der Gegenseite
+            // (und, gewichtet mit centerP, der eigenen Seite), nicht der Eingang.
             int readIndex = (writeIndex - dn + bufferSize) % bufferSize;
-            double delayedMidL = delayBufferL[readIndex];
-            double delayedMidR = delayBufferR[readIndex];
+            double delayedOutL = delayBufferL[readIndex];
+            double delayedOutR = delayBufferR[readIndex];
 
             double crossTalkL = 0.0;
             double crossTalkR = 0.0;
 
             if (raceEnabled) {
-                crossTalkL = attenuationLinear * (delayedMidR - centerP * delayedMidL) / (1.0 + centerP);
-                crossTalkR = attenuationLinear * (delayedMidL - centerP * delayedMidR) / (1.0 + centerP);
+                crossTalkL = attenuationLinear * (delayedOutR - centerP * delayedOutL) / (1.0 + centerP);
+                crossTalkR = attenuationLinear * (delayedOutL - centerP * delayedOutR) / (1.0 + centerP);
             }
 
             double currentRaceMidL = midInL - crossTalkL;
             double currentRaceMidR = midInR - crossTalkR;
 
-            // Feed-Forward Architektur (Phasenrein)
-            delayBufferL[writeIndex] = midInL; 
-            delayBufferR[writeIndex] = midInR; 
+            // Schutz des Rueckkopplungspfads: Ein einziger NaN/Inf (z.B. aus einer
+            // ungueltigen Filterberechnung) wuerde sonst dauerhaft im Delay-Puffer
+            // kreisen. In dem Fall wird der Zustand verworfen.
+            if (!std::isfinite(currentRaceMidL) || !std::isfinite(currentRaceMidR)) {
+                std::fill(delayBufferL.begin(), delayBufferL.end(), 0.0);
+                std::fill(delayBufferR.begin(), delayBufferR.end(), 0.0);
+                currentRaceMidL = 0.0;
+                currentRaceMidR = 0.0;
+            }
+
+            // Rekursion: Der RACE-Ausgang (vor Bypass-Summe, Makeup und Volume) wird
+            // zurueckgefuehrt. Winzige Werte werden auf 0 gesetzt, damit der
+            // abklingende Nachhall der Schleife nicht in Denormals ausfaellt.
+            delayBufferL[writeIndex] = (std::fabs(currentRaceMidL) < kDenormalGuard) ? 0.0 : currentRaceMidL;
+            delayBufferR[writeIndex] = (std::fabs(currentRaceMidR) < kDenormalGuard) ? 0.0 : currentRaceMidR;
             writeIndex = (writeIndex + 1) % bufferSize;
 
             double outL = bypassL + currentRaceMidL;
@@ -364,23 +468,8 @@ void RACEDspEngine::processSamples(float* interleavedSamples, size_t frames) {
             outL *= makeupGainLinear;
             outR *= makeupGainLinear;
 
-            outL *= volume;
-            outR *= volume;
-
-            if (outL > 1.0 || outL < -1.0 || outR > 1.0 || outR < -1.0) {
-                static int clipCount = 0; 
-                if (clipCount++ % 100 == 0) {
-                   std::cerr << "[WARN] DSP Clipping erkannt! L: " << outL << ", R: " << outR << std::endl;
-                }
-            }
-
-            // KORRIGIERT: Hard-Clipping am äußersten Rand für ALSA
-            outL = std::clamp(outL, -1.0, 1.0);
-            outR = std::clamp(outR, -1.0, 1.0);
-
-            // UI Speisung
-            spectrumBuffer[spectrumIndex] = static_cast<float>((outL + outR) * 0.5);
-            spectrumIndex = (spectrumIndex + 1) % 32768;
+            // Lautstaerke, Begrenzung und Spektrum folgen erst beim Auslesen (Echtzeit,
+            // sonst wirkt eine Reglerbewegung erst nach ~250 ms Pipeline-Latenz).
 
             outputFifoL.push_back(outL);
             outputFifoR.push_back(outR);
@@ -389,8 +478,25 @@ void RACEDspEngine::processSamples(float* interleavedSamples, size_t frames) {
 
     size_t available = std::min(frames, outputFifoL.size());
     for (size_t i = 0; i < available; i++) {
-        interleavedSamples[i * 2] = static_cast<float>(outputFifoL[i]);
-        interleavedSamples[i * 2 + 1] = static_cast<float>(outputFifoR[i]);
+        const double vol = nextVolume();
+        double outL = outputFifoL[i] * vol;
+        double outR = outputFifoR[i] * vol;
+
+        if (outL > 1.0 || outL < -1.0 || outR > 1.0 || outR < -1.0) {
+            static int clipCount = 0;
+            if (clipCount++ % 100 == 0) {
+                std::cerr << "[WARN] DSP Clipping erkannt! L: " << outL << ", R: " << outR << std::endl;
+            }
+        }
+        // Hard-Clipping am aeussersten Rand fuer ALSA
+        outL = std::clamp(outL, -1.0, 1.0);
+        outR = std::clamp(outR, -1.0, 1.0);
+
+        spectrumBuffer[spectrumIndex] = static_cast<float>((outL + outR) * 0.5);
+        spectrumIndex = (spectrumIndex + 1) % 32768;
+
+        interleavedSamples[i * 2] = static_cast<float>(outL);
+        interleavedSamples[i * 2 + 1] = static_cast<float>(outR);
     }
     for (size_t i = available; i < frames; i++) {
         interleavedSamples[i * 2] = 0.0f;
@@ -401,7 +507,8 @@ void RACEDspEngine::processSamples(float* interleavedSamples, size_t frames) {
         outputFifoL.erase(outputFifoL.begin(), outputFifoL.begin() + available);
         outputFifoR.erase(outputFifoR.begin(), outputFifoR.begin() + available);
     }
-}
+writeRecording();
+} // Ende von processSamples
 
 std::vector<double> RACEDspEngine::getSpectrumBands() {
     std::vector<float> audioData(32768, 0.0f);
@@ -470,7 +577,11 @@ double RACEDspEngine::getEqQ(int bandIndex) { if (bandIndex >= 0 && bandIndex < 
 double RACEDspEngine::getEqGain(int bandIndex) { if (bandIndex >= 0 && bandIndex < 3) return eqBands[bandIndex].g; return 0.0; }
 
 void RACEDspEngine::setCrossoverFreqLow(double freq) {
+    if (!std::isfinite(freq)) return;
     std::lock_guard<std::mutex> lock(dspMutex);
+    const double maxLow = std::max(kMinFilterFreqHz, currentFreqHigh - kMinCrossoverGapHz);
+    freq = std::clamp(freq, kMinFilterFreqHz, maxLow);
+    if (freq == currentFreqLow) return; // unveraendert: teure Filterberechnung sparen
     currentFreqLow = freq;
     firCrossoverL.updateFilters(currentFreqLow, currentFreqHigh);
     firCrossoverR.updateFilters(currentFreqLow, currentFreqHigh);
@@ -478,7 +589,12 @@ void RACEDspEngine::setCrossoverFreqLow(double freq) {
 double RACEDspEngine::getCrossoverFreqLow() { return currentFreqLow; }
 
 void RACEDspEngine::setCrossoverFreqHigh(double freq) {
+    if (!std::isfinite(freq)) return;
     std::lock_guard<std::mutex> lock(dspMutex);
+    const double minHigh = currentFreqLow + kMinCrossoverGapHz;
+    const double maxHigh = std::max(minHigh, kMaxFreqFraction * static_cast<double>(sampleRate));
+    freq = std::clamp(freq, minHigh, maxHigh);
+    if (freq == currentFreqHigh) return; // unveraendert: teure Filterberechnung sparen
     currentFreqHigh = freq;
     firCrossoverL.updateFilters(currentFreqLow, currentFreqHigh);
     firCrossoverR.updateFilters(currentFreqLow, currentFreqHigh);
@@ -492,4 +608,37 @@ void RACEDspEngine::setLowBypassEnabled(bool enabled) {
 
 bool RACEDspEngine::getLowBypassEnabled() {
     return lowBypassEnabled;
+}
+bool RACEDspEngine::startRecording(const std::string& filepath, const std::string& format) {
+    std::lock_guard<std::mutex> lock(record_mutex);
+    
+    memset(&sfinfo, 0, sizeof(sfinfo));
+    sfinfo.samplerate = sampleRate; // Nutzt die Instanz-Variable der Engine
+    sfinfo.channels = 2;
+
+    if (format == "flac") {
+        sfinfo.format = SF_FORMAT_FLAC | SF_FORMAT_PCM_24;
+    } else {
+        sfinfo.format = SF_FORMAT_WAV | SF_FORMAT_PCM_24;
+    }
+
+    outfile = sf_open(filepath.c_str(), SFM_WRITE, &sfinfo);
+    
+    if (outfile == nullptr) {
+        return false;
+    }
+
+    is_recording.store(true);
+    return true;
+}
+
+void RACEDspEngine::stopRecording() {
+    is_recording.store(false);
+    
+    std::lock_guard<std::mutex> lock(record_mutex);
+    if (outfile != nullptr) {
+        sf_write_sync(outfile);
+        sf_close(outfile);
+        outfile = nullptr;
+    }
 }

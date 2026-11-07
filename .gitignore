@@ -1,6 +1,14 @@
+# Compiled Object files
 *.o
+*.d
+
+# Executable
 OAPW_Player
-*.wav
-pink_noise.wav
-.DS_Store
-*.csv
+
+# Log files and Backups
+*.log
+*.bck
+
+# User specific configuration
+oapw_config.txt
+oapw_device.txt

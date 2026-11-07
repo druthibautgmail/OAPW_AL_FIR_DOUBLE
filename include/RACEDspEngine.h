@@ -3,6 +3,9 @@
 
 #include <vector>
 #include <mutex>
+#include <sndfile.h>
+#include <atomic>
+#include <string>
 #include <array>
 #include <complex>
 #include <cstdint>
@@ -49,7 +52,9 @@ private:
     int dn;
     bool freqLimitRACE;
     double currentFreqLow, currentFreqHigh;
-    double volume;
+    double volume;                 // Ziel-Lautstaerke (0..1), vom Anwender gesetzt
+    double volumeRamp;             // tatsaechlich angewendete Lautstaerke (rampt zum Ziel)
+    double volumeStepUp, volumeStepDown; // max. Aenderung pro Sample
     double makeupGainDb;
     double makeupGainLinear;
     bool raceEnabled, filtersEnabled, eqEnabled;
@@ -80,9 +85,22 @@ private:
 
     std::mutex dspMutex;
 
+    // neu in Version 20.0 für das Herausschreiben von Dateien (.wav, .flac) U. Thibaut 06.11.26
+    std::atomic<bool> is_recording{false};
+    std::mutex record_mutex;
+    SNDFILE* outfile = nullptr;
+    SF_INFO sfinfo;
 public:
+    // Sicherheit fuer Endstufen/Lautsprecher: Startlautstaerke und Obergrenze beim Laden der Config
+    static constexpr double kDefaultVolume  = 0.10; // ca. -20 dB
+    static constexpr double kMaxStartVolume = 0.25; // ca. -12 dB
+    static constexpr double kMaxMakeupGainDb = 6.0; // Obergrenze Makeup-Gain (Config, Web, Code)
     RACEDspEngine(double initialDelayUs, double initialAttenuationDb, double initialCenterP, bool initialFreqLimit, int sampleRate = 192000);
     ~RACEDspEngine();
+
+    // Neu für Aufnahme-Steuerung
+    bool startRecording(const std::string& filepath, const std::string& format);
+    void stopRecording();
 
     void setParameters(double newDelayUs, double newAttenuationDb, double newCenterP, bool newFreqLimit);
     void setCrossoverFreqLow(double freq);

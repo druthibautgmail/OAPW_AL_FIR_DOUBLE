@@ -1,0 +1,8 @@
+# Zeilen mit '#' sind Kommentare. Nicht benoetigte Zeilen kann man loeschen.
+# Verfuegbare Namen erhaelt man ggf. vom Aufruf:: ./OAPW_Player --list-devices
+
+capture=hw:Loopback,1,0
+playback=hw:Katana,0
+rate=192000
+format=S32_LE
+capture_format=S32_LE
